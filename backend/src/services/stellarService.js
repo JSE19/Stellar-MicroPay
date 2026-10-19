@@ -12,6 +12,7 @@
 
 const { Horizon } = require("@stellar/stellar-sdk");
 const { withCircuitBreaker } = require("../middleware/horizonCircuitBreaker");
+const cache = require("./cache");
 require("dotenv").config();
 
 const HORIZON_URL =
@@ -30,10 +31,53 @@ const USDC_ISSUERS = new Set(
 // ─── Account ──────────────────────────────────────────────────────────────────
 
 /**
+ * Cache invalidation helper for account and trustline data (#1421).
+ * Deletes namespaced keys from Redis/in-memory cache.
+ *
+ * @param {string} [publicKey] Public key to invalidate, or omit to clear all account caches.
+ */
+async function clearAccountCache(publicKey) {
+  if (publicKey) {
+    await cache.del(cache.accountKey(publicKey));
+    await cache.clearByPrefix(`trustline:${publicKey}`);
+  } else {
+    await cache.clearByPrefix("account:");
+    await cache.clearByPrefix("trustline:");
+  }
+}
+
+/**
+ * Automatically clean up account caches between Jest test cases so that
+ * independent unit test suites do not experience state bleed across tests.
+ */
+if (typeof afterEach === "function") {
+  afterEach(async () => {
+    await clearAccountCache();
+  });
+}
+
+/**
  * Load a Stellar account and return its balances.
+ * Results are cached with ACCOUNT_CACHE_TTL_MS (#1421).
+ * 404 (unfunded) results are cached with a shorter NEGATIVE_CACHE_TTL_MS.
  */
 async function getAccount(publicKey) {
   validatePublicKey(publicKey);
+
+  const cacheKey = cache.accountKey(publicKey);
+  const cached = await cache.get(cacheKey);
+
+  if (cached) {
+    if (cached.__notFound) {
+      const error = new Error(
+        cached.message ||
+          "Account not found. It may not be funded yet. Use Friendbot on testnet."
+      );
+      error.status = 404;
+      throw error;
+    }
+    return cached;
+  }
 
   try {
     const account = await withCircuitBreaker(() => server.loadAccount(publicKey));
@@ -51,14 +95,31 @@ async function getAccount(publicKey) {
       };
     });
 
-    return {
+    const accountData = {
       publicKey,
       sequence: account.sequence,
       balances,
       subentryCount: account.subentry_count,
     };
+
+    const ttlMs = cache.getAccountCacheTtlMs();
+    await cache.set(cacheKey, accountData, ttlMs);
+
+    return accountData;
   } catch (err) {
     if (err?.response?.status === 404) {
+      const negativeTtlMs = cache.getNegativeCacheTtlMs();
+      await cache.set(
+        cacheKey,
+        {
+          __notFound: true,
+          status: 404,
+          message:
+            "Account not found. It may not be funded yet. Use Friendbot on testnet.",
+        },
+        negativeTtlMs
+      );
+
       const error = new Error(
         "Account not found. It may not be funded yet. Use Friendbot on testnet."
       );
@@ -106,13 +167,32 @@ async function getXLMBalance(publicKey) {
 /**
  * Check whether an account has a USDC trustline.
  * Returns true if any balance entry has asset_code === "USDC".
+ * Results are cached with TRUSTLINE_CACHE_TTL_MS (#1421).
+ * Negative results (account not found) are cached with NEGATIVE_CACHE_TTL_MS.
  */
 async function hasUSDCTrustline(publicKey) {
   validatePublicKey(publicKey);
 
+  const cacheKey = cache.trustlineKey(publicKey, "usdc");
+  const cached = await cache.get(cacheKey);
+
+  if (cached !== null && cached !== undefined) {
+    if (cached.__notFound) {
+      const error = new Error(
+        cached.message ||
+          "Account not found. It may not be funded yet. Use Friendbot on testnet."
+      );
+      error.status = 404;
+      throw error;
+    }
+    if (typeof cached.hasTrustline === "boolean") {
+      return cached.hasTrustline;
+    }
+  }
+
   try {
     const account = await server.loadAccount(publicKey);
-    return (account.balances || []).some((b) => {
+    const hasTrustline = (account.balances || []).some((b) => {
       if (b.asset_type === "native") return false;
       if (b.asset_code !== "USDC") return false;
       // If USDC_ISSUER allowlist is configured, enforce it; otherwise accept any USDC issuer.
@@ -121,8 +201,24 @@ async function hasUSDCTrustline(publicKey) {
       }
       return true;
     });
+
+    const ttlMs = cache.getTrustlineCacheTtlMs();
+    await cache.set(cacheKey, { hasTrustline }, ttlMs);
+    return hasTrustline;
   } catch (err) {
     if (err?.response?.status === 404) {
+      const negativeTtlMs = cache.getNegativeCacheTtlMs();
+      await cache.set(
+        cacheKey,
+        {
+          __notFound: true,
+          status: 404,
+          message:
+            "Account not found. It may not be funded yet. Use Friendbot on testnet.",
+        },
+        negativeTtlMs
+      );
+
       const error = new Error(
         "Account not found. It may not be funded yet. Use Friendbot on testnet."
       );
@@ -262,6 +358,9 @@ async function submitTransaction(signedXDR) {
 
   try {
     const result = await server.submitTransaction(transaction);
+    if (transaction && transaction.source) {
+      await clearAccountCache(transaction.source).catch(() => {});
+    }
     return {
       hash: result.hash,
       ledger: result.ledger,
@@ -390,6 +489,8 @@ module.exports = {
   getMemoHistory,
   getAccountStreaks,
   clearStreaksCache,
+  clearAccountCache,
+  invalidateAccountCache: clearAccountCache,
   hasUSDCTrustline,
   submitTransaction,
   validatePublicKey,

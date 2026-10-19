@@ -1,12 +1,42 @@
 /**
  * src/controllers/federationController.js
  * Handles federation requests per SEP-0002.
+ * Supports namespaced caching with configurable FEDERATION_CACHE_TTL_MS and
+ * negative result caching with NEGATIVE_CACHE_TTL_MS (#1421).
  */
 
 "use strict";
 
 const axios = require("axios");
 const usernameService = require("../services/usernameService");
+const cache = require("../services/cache");
+
+/**
+ * Invalidate cached federation resolutions. Part of cache invalidation path (#1421).
+ * @param {string} [query] The query string (stellar address or account ID) to invalidate.
+ * @param {"name"|"id"} [type] The query type.
+ */
+async function clearFederationCache(query, type) {
+  if (query && type) {
+    const key = cache.federationKey(type, query);
+    await cache.del(key);
+  } else if (query) {
+    await cache.clearByPrefix(`federation:name:${String(query).toLowerCase().trim()}`);
+    await cache.clearByPrefix(`federation:id:${String(query).trim()}`);
+  } else {
+    await cache.clearByPrefix("federation:");
+  }
+}
+
+/**
+ * Clean up federation caches between Jest tests so unit test suites
+ * remain isolated and deterministic.
+ */
+if (typeof afterEach === "function") {
+  afterEach(async () => {
+    await clearFederationCache();
+  });
+}
 
 /**
  * GET /federation?q=<query>&type=<type>
@@ -22,19 +52,54 @@ async function resolveFederation(req, res, next) {
       });
     }
 
-    if (type === "name") {
-      // Resolve stellar address to account ID
-      const result = await resolveStellarAddress(q);
-      return res.json(result);
-    } else if (type === "id") {
-      // Resolve account ID to stellar address
-      const result = await resolveAccountId(q);
-      return res.json(result);
-    } else {
+    if (type !== "name" && type !== "id") {
       return res.status(400).json({
         error: "Invalid type parameter. Must be 'name' or 'id'",
       });
     }
+
+    const cacheKey = cache.federationKey(type, q);
+    const cached = await cache.get(cacheKey);
+
+    if (cached) {
+      if (cached.__notFound) {
+        return res.status(404).json({
+          error: cached.error || "Not found",
+        });
+      }
+      return res.json(cached);
+    }
+
+    let result;
+    try {
+      if (type === "name") {
+        result = await resolveStellarAddress(q);
+      } else {
+        result = await resolveAccountId(q);
+      }
+    } catch (lookupErr) {
+      const isNotFound =
+        (lookupErr.response && lookupErr.response.status === 404) ||
+        lookupErr.status === 404;
+
+      if (isNotFound) {
+        const negativeTtlMs = cache.getNegativeCacheTtlMs();
+        const errorMessage = lookupErr.status === 404 ? lookupErr.message : "Not found";
+        await cache.set(
+          cacheKey,
+          { __notFound: true, status: 404, error: errorMessage },
+          negativeTtlMs
+        );
+        return res.status(404).json({
+          error: errorMessage,
+        });
+      }
+      throw lookupErr;
+    }
+
+    const federationTtlMs = cache.getFederationCacheTtlMs();
+    await cache.set(cacheKey, result, federationTtlMs);
+    return res.json(result);
   } catch (err) {
     if (err.response && err.response.status === 404) {
       return res.status(404).json({
@@ -163,4 +228,11 @@ function parseFederationServer(tomlContent) {
   return server;
 }
 
-module.exports = { resolveFederation };
+module.exports = {
+  resolveFederation,
+  clearFederationCache,
+  invalidateFederationCache: clearFederationCache,
+  resolveStellarAddress,
+  resolveAccountId,
+  forwardFederation,
+};

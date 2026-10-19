@@ -66,3 +66,4 @@ backend/data/
 
 # Contract IDs written by `make deploy-local` (local network only)
 .contract-id.local
+fix.md

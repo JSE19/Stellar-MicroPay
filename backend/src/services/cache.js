@@ -1,32 +1,92 @@
 /**
  * src/services/cache.js
- * Redis-backed caching layer for analytics with in-memory fallback.
+ * Redis-backed caching layer with in-memory fallback (#1072, #1421).
  *
- * When `REDIS_URL` is set the cache stores entries in Redis so that data
- * survives restarts and is shared across multiple backend instances.  If
- * Redis is unavailable (connection refused, missing env var, etc.) the cache
- * transparently falls back to an in-process `Map` so the service keeps working
- * — just without cross-instance sharing.
+ * Supports namespaced caches with explicit, per-type TTLs:
+ *  - Analytics: ANALYTICS_CACHE_TTL_MS (default: 5 minutes)
+ *  - Account lookups: ACCOUNT_CACHE_TTL_MS (default: 60 seconds, key: "account:<publicKey>")
+ *  - Trustline lookups: TRUSTLINE_CACHE_TTL_MS (default: 60 seconds, key: "trustline:<publicKey>:<asset>")
+ *  - Federation resolutions: FEDERATION_CACHE_TTL_MS (default: 5 minutes, key: "federation:<type>:<query>")
+ *  - Negative results: NEGATIVE_CACHE_TTL_MS (default: 10 seconds)
  *
- * TTL is controlled by `ANALYTICS_CACHE_TTL_MS` (default 5 minutes).
+ * Cache Invalidation Path:
+ *  - Invalidation by key: cache.del(key) removes single lookup entries.
+ *  - Invalidation by namespace/prefix: cache.clearByPrefix(prefix) removes matching keys
+ *    (e.g., cache.clearByPrefix("account:") or cache.clearByPrefix("federation:")).
+ *  - Programmatic invalidation helpers:
+ *      * stellarService.clearAccountCache(publicKey) invalidates account and trustline entries.
+ *      * federationController.clearFederationCache(query, type) invalidates federation lookups.
+ *  - Automatic write invalidation: submitTransaction(signedXDR) invalidates source account cache.
+ *  - Automatic TTL expiration: entries expire automatically in Redis (via SETEX) and in memory (via timestamp checks).
  */
 
 "use strict";
 
-const DEFAULT_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
-const CACHE_TTL_MS = parseInt(
-  process.env.ANALYTICS_CACHE_TTL_MS || String(DEFAULT_CACHE_TTL_MS),
-  10,
-);
+const DEFAULT_ANALYTICS_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const DEFAULT_ACCOUNT_TTL_MS = 60 * 1000; // 60 seconds
+const DEFAULT_TRUSTLINE_TTL_MS = 60 * 1000; // 60 seconds
+const DEFAULT_FEDERATION_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const DEFAULT_NEGATIVE_TTL_MS = 10 * 1000; // 10 seconds
+
 const REDIS_URL = process.env.REDIS_URL || null;
 const MAX_MEMORY_ENTRIES = parseInt(
   process.env.ANALYTICS_CACHE_MAX_ENTRIES || "500",
   10,
 );
 
+function parseTtl(envVal, fallbackMs) {
+  if (envVal === undefined || envVal === null || envVal === "") return fallbackMs;
+  const parsed = parseInt(envVal, 10);
+  return !isNaN(parsed) && parsed >= 0 ? parsed : fallbackMs;
+}
+
+function getAnalyticsCacheTtlMs() {
+  return parseTtl(process.env.ANALYTICS_CACHE_TTL_MS, DEFAULT_ANALYTICS_TTL_MS);
+}
+
+function getAccountCacheTtlMs() {
+  return parseTtl(process.env.ACCOUNT_CACHE_TTL_MS, DEFAULT_ACCOUNT_TTL_MS);
+}
+
+function getTrustlineCacheTtlMs() {
+  return parseTtl(process.env.TRUSTLINE_CACHE_TTL_MS, DEFAULT_TRUSTLINE_TTL_MS);
+}
+
+function getFederationCacheTtlMs() {
+  return parseTtl(process.env.FEDERATION_CACHE_TTL_MS, DEFAULT_FEDERATION_TTL_MS);
+}
+
+function getNegativeCacheTtlMs() {
+  return parseTtl(
+    process.env.NEGATIVE_CACHE_TTL_MS || process.env.ACCOUNT_NEGATIVE_CACHE_TTL_MS,
+    DEFAULT_NEGATIVE_TTL_MS
+  );
+}
+
+const CACHE_NAMESPACES = {
+  ACCOUNT: "account:",
+  TRUSTLINE: "trustline:",
+  FEDERATION: "federation:",
+  ANALYTICS: "analytics:",
+};
+
+function accountKey(publicKey) {
+  return `account:${publicKey}`;
+}
+
+function trustlineKey(publicKey, asset = "usdc") {
+  return `trustline:${publicKey}:${asset.toLowerCase()}`;
+}
+
+function federationKey(type, query) {
+  const normalized =
+    type === "name" ? String(query).toLowerCase().trim() : String(query).trim();
+  return `federation:${type}:${normalized}`;
+}
+
 class AnalyticsCache {
   constructor() {
-    /** @type {Map<string, { data: *, timestamp: number }>} */
+    /** @type {Map<string, { data: *, timestamp: number, ttlMs: number, expiresAt: number }>} */
     this.memoryCache = new Map();
     /** @type {import("redis").RedisClientType | null} */
     this.redisClient = null;
@@ -112,38 +172,61 @@ class AnalyticsCache {
    */
   _getMemory(key) {
     const entry = this.memoryCache.get(key);
+    if (!entry) {
+      return null;
+    }
 
-    if (entry && Date.now() - entry.timestamp < CACHE_TTL_MS) {
+    const ttl =
+      typeof entry.ttlMs === "number" ? entry.ttlMs : getAnalyticsCacheTtlMs();
+    const isExpired = entry.expiresAt
+      ? Date.now() >= entry.expiresAt
+      : Date.now() - entry.timestamp >= ttl;
+
+    if (!isExpired) {
       // Refresh recency (LRU): move to the end of the Map.
       this.memoryCache.delete(key);
       this.memoryCache.set(key, entry);
       return entry.data;
     }
 
-    if (entry) {
-      this.memoryCache.delete(key);
-    }
+    this.memoryCache.delete(key);
     return null;
   }
 
-  _setMemory(key, value) {
+  _setMemory(key, value, ttlMs) {
+    const effectiveTtlMs =
+      typeof ttlMs === "number" && !isNaN(ttlMs)
+        ? ttlMs
+        : getAnalyticsCacheTtlMs();
+
     this.memoryCache.delete(key);
-    this.memoryCache.set(key, { data: value, timestamp: Date.now() });
+    this.memoryCache.set(key, {
+      data: value,
+      timestamp: Date.now(),
+      ttlMs: effectiveTtlMs,
+      expiresAt: Date.now() + effectiveTtlMs,
+    });
     while (this.memoryCache.size > MAX_MEMORY_ENTRIES) {
       this.memoryCache.delete(this.memoryCache.keys().next().value);
     }
   }
 
   /**
-   * Store a value in the cache with the configured TTL.
+   * Store a value in the cache with the configured or explicit TTL.
    * @param {string} key
    * @param {*} value
+   * @param {number} [ttlMs] Explicit TTL in milliseconds; defaults to configured analytics TTL.
    * @returns {Promise<void>}
    */
-  async set(key, value) {
+  async set(key, value, ttlMs) {
+    const effectiveTtlMs =
+      typeof ttlMs === "number" && !isNaN(ttlMs)
+        ? ttlMs
+        : getAnalyticsCacheTtlMs();
+
     if (this.usingRedis && this.redisClient) {
       try {
-        const ttlSeconds = Math.max(1, Math.floor(CACHE_TTL_MS / 1000));
+        const ttlSeconds = Math.max(1, Math.floor(effectiveTtlMs / 1000));
         await this.redisClient.setEx(key, ttlSeconds, JSON.stringify(value));
         return;
       } catch (err) {
@@ -155,7 +238,7 @@ class AnalyticsCache {
       }
     }
 
-    this._setMemory(key, value);
+    this._setMemory(key, value, effectiveTtlMs);
   }
 
   /**
@@ -177,7 +260,7 @@ class AnalyticsCache {
   /**
    * Delete every key that starts with `prefix`.
    * @param {string} prefix
-   * @returns {Promise<void>}
+   * @returns {Promise<number>} Number of keys removed.
    */
   async clearByPrefix(prefix) {
     const removed = new Set();
@@ -205,6 +288,24 @@ class AnalyticsCache {
   }
 
   /**
+   * Clear the entire cache.
+   */
+  async clear() {
+    if (this.usingRedis && this.redisClient) {
+      try {
+        await this.redisClient.flushDb();
+      } catch {
+        // Ignore errors during clearing
+      }
+    }
+    this.memoryCache.clear();
+  }
+
+  clearSync() {
+    this.memoryCache.clear();
+  }
+
+  /**
    * Synchronous read that checks memory only (used internally and in tests
    * that do not have Redis configured).
    * @param {string} key
@@ -218,9 +319,10 @@ class AnalyticsCache {
    * Synchronous write to memory only.
    * @param {string} key
    * @param {*} value
+   * @param {number} [ttlMs]
    */
-  setSync(key, value) {
-    this._setMemory(key, value);
+  setSync(key, value, ttlMs) {
+    this._setMemory(key, value, ttlMs);
   }
 
   /**
@@ -232,4 +334,23 @@ class AnalyticsCache {
   }
 }
 
-module.exports = new AnalyticsCache();
+const cacheInstance = new AnalyticsCache();
+cacheInstance.AnalyticsCache = AnalyticsCache;
+cacheInstance.DEFAULT_ANALYTICS_TTL_MS = DEFAULT_ANALYTICS_TTL_MS;
+cacheInstance.DEFAULT_ACCOUNT_TTL_MS = DEFAULT_ACCOUNT_TTL_MS;
+cacheInstance.DEFAULT_TRUSTLINE_TTL_MS = DEFAULT_TRUSTLINE_TTL_MS;
+cacheInstance.DEFAULT_FEDERATION_TTL_MS = DEFAULT_FEDERATION_TTL_MS;
+cacheInstance.DEFAULT_NEGATIVE_TTL_MS = DEFAULT_NEGATIVE_TTL_MS;
+cacheInstance.CACHE_NAMESPACES = CACHE_NAMESPACES;
+
+cacheInstance.getAnalyticsCacheTtlMs = getAnalyticsCacheTtlMs;
+cacheInstance.getAccountCacheTtlMs = getAccountCacheTtlMs;
+cacheInstance.getTrustlineCacheTtlMs = getTrustlineCacheTtlMs;
+cacheInstance.getFederationCacheTtlMs = getFederationCacheTtlMs;
+cacheInstance.getNegativeCacheTtlMs = getNegativeCacheTtlMs;
+
+cacheInstance.accountKey = accountKey;
+cacheInstance.trustlineKey = trustlineKey;
+cacheInstance.federationKey = federationKey;
+
+module.exports = cacheInstance;
