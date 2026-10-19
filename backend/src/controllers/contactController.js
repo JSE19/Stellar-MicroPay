@@ -1,6 +1,7 @@
 "use strict";
 
 const contactService = require("../services/contactService");
+const { AppError } = require("../middleware/errorHandler");
 
 function owner(req) {
   return req.user.publicKey;
@@ -18,9 +19,9 @@ function create(req, res, next) {
   }
 }
 
-function remove(req, res) {
+function remove(req, res, next) {
   const removed = contactService.removeContact(owner(req), req.params.id);
-  if (!removed) return res.status(404).json({ success: false, error: "Contact not found" });
+  if (!removed) return next(new AppError(404, "Contact not found", "NOT_FOUND"));
   return res.status(204).send();
 }
 

@@ -7,6 +7,7 @@
 
 const tipsService = require("../services/tipsService");
 const webhookService = require("../services/webhookService");
+const { AppError } = require("../middleware/errorHandler");
 
 /**
  * POST /api/tips
@@ -188,7 +189,7 @@ function setLeaderboardOptOut(req, res, next) {
   try {
     const { optOut } = req.body || {};
     if (typeof optOut !== "boolean") {
-      return res.status(400).json({ success: false, error: "optOut must be a boolean" });
+      return next(new AppError(400, "optOut must be a boolean", "VALIDATION_ERROR"));
     }
     const data = tipsService.setLeaderboardOptOut(req.user.publicKey, optOut);
     res.json({ success: true, data });

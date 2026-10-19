@@ -31,7 +31,11 @@ const turretsRoutes = require("./routes/turrets");
 const tipsRoutes = require("./routes/tips");
 const pushRoutes = require("./routes/push");
 const webhooksRoutes = require("./routes/webhooks");
+const contactsRoutes = require("./routes/contacts");
+const networkRoutes = require("./routes/network");
+const priceAlertsRoutes = require("./routes/priceAlerts");
 const requestId = require("./middleware/requestId");
+const { AppError, errorHandler, notFoundHandler } = require("./middleware/errorHandler");
 const swaggerUi = require("swagger-ui-express");
 const swaggerSpec = require("./swagger");
 const { startTurretsServer } = require("./turretsServer");
@@ -41,20 +45,6 @@ const { sanitizeRequest } = require("./middleware/sanitization");
 const app = express();
 const PORT = process.env.PORT || 4000;
 
-/**
- * Attach a correlation id to every request: echo the caller's X-Request-ID
- * when supplied, otherwise generate one. The id is echoed back on the
- * response and available to pino-http and the error handler.
- */
-function requestId(req, res, next) {
-  const supplied = req.headers["x-request-id"];
-  req.requestId =
-    typeof supplied === "string" && supplied.trim()
-      ? supplied.trim()
-      : crypto.randomUUID();
-  res.setHeader("X-Request-ID", req.requestId);
-  next();
-}
 // ─── Middleware ─────────────────────────────────────────────────────────────────
 
 app.use(requestId);
@@ -70,7 +60,7 @@ app.use(express.json({ limit: "10kb" }));
 // JSON parsing error handler
 app.use((err, req, res, next) => {
   if (err instanceof SyntaxError && err.status === 400 && "body" in err) {
-    return res.status(400).json({ error: "Invalid JSON body" });
+    return next(new AppError(400, "Invalid JSON body", "BAD_REQUEST"));
   }
   // Forward other body-parser errors (e.g. 413 payload too large) so they are
   // not silently swallowed and the request does not reach the route handlers.
@@ -172,18 +162,6 @@ app.get("/api/docs.json", (req, res) => {
   res.send(swaggerSpec);
 });
 
-// ─── Error Handling ────────────────────────────────────────────────────────────
-
-app.use((err, req, res, next) => {
-  void next;
-  const status = err.status || 500;
-  const message = err.message || "Internal Server Error";
-
-  req.log.error({ err, requestId: req.requestId, status }, "Request failed");
-
-  res.status(status).json({ error: message });
-});
-
 // ─── Static Files ─────────────────────────────────────────────────────────────
 
 app.get("/.well-known/stellar.toml", (req, res) => {
@@ -195,6 +173,11 @@ SERVER = "https://${domain}/federation"
   res.setHeader("Content-Type", "application/toml");
   res.send(tomlContent);
 });
+
+// ─── Error Handling ────────────────────────────────────────────────────────────
+
+app.use(notFoundHandler);
+app.use(errorHandler);
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 

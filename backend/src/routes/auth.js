@@ -17,6 +17,7 @@ const {
   authChallengeLimiter,
   authVerifyLimiter,
 } = require("../middleware/rateLimit");
+const { AppError } = require("../middleware/errorHandler");
 
 const router = express.Router();
 
@@ -37,10 +38,10 @@ function getServerKeypair() {
 }
 
 // GET /api/auth/challenge?account=G... — issue a SEP-0010 challenge transaction
-function issueChallenge(req, res) {
+function issueChallenge(req, res, next) {
   const { account } = req.query;
   if (!account) {
-    return res.status(400).json({ error: "Missing account query parameter" });
+    return next(new AppError(400, "Missing account query parameter", "BAD_REQUEST"));
   }
 
   try {
@@ -54,7 +55,7 @@ function issueChallenge(req, res) {
     );
     res.json({ transaction: challenge, networkPassphrase: NETWORK_PASSPHRASE });
   } catch (e) {
-    res.status(400).json({ error: e.message });
+    next(new AppError(400, e.message, "BAD_REQUEST"));
   }
 }
 
@@ -63,10 +64,10 @@ router.get("/challenge", authChallengeLimiter, issueChallenge);
 router.get("/", authChallengeLimiter, issueChallenge);
 
 // POST /api/auth/verify — verify signed challenge and issue JWT
-function verifyChallenge(req, res) {
+function verifyChallenge(req, res, next) {
   const { transaction } = req.body;
   if (!transaction) {
-    return res.status(400).json({ error: "Missing transaction in request body" });
+    return next(new AppError(400, "Missing transaction in request body", "BAD_REQUEST"));
   }
 
   try {
@@ -93,7 +94,7 @@ function verifyChallenge(req, res) {
 
     res.json({ success: true, token, csrfToken });
   } catch (e) {
-    res.status(401).json({ error: "Unauthorized: " + e.message });
+    next(new AppError(401, "Unauthorized: " + e.message, "UNAUTHORIZED"));
   }
 }
 

@@ -10,6 +10,7 @@ const router = express.Router();
 const { strictLimiter } = require("../middleware/rateLimit");
 const { verifyJWT } = require("../middleware/auth");
 const { validatePublicKey, sanitizePublicKey } = require("../middleware/sanitization");
+const { AppError } = require("../middleware/errorHandler");
 const analyticsController = require("../controllers/analyticsController");
 
 function getAdminPublicKeys() {
@@ -22,10 +23,10 @@ function getAdminPublicKeys() {
 function requireAdmin(req, res, next) {
   const adminPublicKeys = getAdminPublicKeys();
   if (adminPublicKeys.length === 0) {
-    return res.status(403).json({ error: "Forbidden: no admin accounts configured" });
+    return next(new AppError(403, "Forbidden: no admin accounts configured", "FORBIDDEN"));
   }
   if (!req.user || !adminPublicKeys.includes(req.user.publicKey)) {
-    return res.status(403).json({ error: "Forbidden: admin access required" });
+    return next(new AppError(403, "Forbidden: admin access required", "FORBIDDEN"));
   }
   next();
 }

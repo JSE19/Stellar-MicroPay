@@ -2,10 +2,12 @@
 import express, { Application, Request, Response } from "express";
 import { receiptRoutes } from "./routes/receipts";
 import { aiPaymentRoutes } from "./routes/aiPayment";
-// Import other route modules (e.g., paymentRoutes, etc.)
+import { errorHandler, notFoundHandler } from "./middleware/errorHandler";
+const requestId = require("./middleware/requestId");
 
 const app: Application = express();
 
+app.use(requestId);
 app.use(express.json());
 
 // 1. Mount existing routes under /api/v1/
@@ -25,5 +27,11 @@ app.all("/api/*", (req: Request, res: Response) => {
   const newPath = req.originalUrl.replace(/^\/api/, "/api/v1");
   res.redirect(301, newPath);
 });
+
+// Central 404 handler for undefined routes
+app.use(notFoundHandler);
+
+// Central error-handling middleware (#1422)
+app.use(errorHandler);
 
 export default app;

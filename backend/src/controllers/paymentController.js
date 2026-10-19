@@ -7,6 +7,7 @@
 
 const stellarService = require("../services/stellarService");
 const streamService = require("../services/streamService");
+const { AppError } = require("../middleware/errorHandler");
 
 const STELLAR_PUBLIC_KEY_RE = /^G[A-Z2-7]{55}$/;
 
@@ -60,7 +61,7 @@ async function submitPayment(req, res, next) {
 
     const validation = validateSubmission({ senderPublicKey, recipientPublicKey, amount, asset, txHash });
     if (!validation.ok) {
-      return res.status(400).json({ error: validation.error });
+      return next(new AppError(400, validation.error, "VALIDATION_ERROR"));
     }
 
     const submission = {

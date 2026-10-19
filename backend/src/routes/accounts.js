@@ -9,6 +9,7 @@ const express = require("express");
 const router = express.Router();
 const { strictLimiter } = require("../middleware/rateLimit");
 const { validatePublicKey, sanitizeUsername, sanitizePublicKey } = require("../middleware/sanitization");
+const { verifyJWT } = require("../middleware/auth");
 const accountController = require("../controllers/accountController");
 const { horizonCircuitBreakerMiddleware } = require("../middleware/horizonCircuitBreaker");
 

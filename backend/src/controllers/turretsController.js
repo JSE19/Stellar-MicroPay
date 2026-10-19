@@ -84,6 +84,16 @@ function resume(req, res, next) {
   }
 }
 
+function cancel(req, res, next) {
+  try {
+    const { id } = req.params;
+    const data = turretsService.cancelDeployment(id);
+    res.json({ success: true, data });
+  } catch (err) {
+    next(err);
+  }
+}
+
 function getSigner(req, res) {
   const turretSignerAddress = turretsService.getTurretSignerAddress();
   res.json({ success: true, data: { turretSignerAddress } });
@@ -142,5 +152,4 @@ module.exports = {
   pause,
   resume,
   cancel,
-  createDca,
 };
